@@ -517,45 +517,42 @@
 
             let convId = convIdOverride || null;
 
-            // FIX 1: If no explicit ID is provided, force create a NEW session locally
+            // Step 1: Call /api/start via XHR (matches Python bridge exactly — XHR bypasses React/SPA fetch interceptors)
             if (!convId) {
-                const alphabet = '_-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-                let id = '';
-                const bytes = new Uint8Array(21);
-                window.crypto.getRandomValues(bytes);
-                for (let i = 0; i < 21; i++) {
-                    id += alphabet[bytes[i] & 63];
+                convId = await new Promise((resolve) => {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('POST', 'https://copilot.microsoft.com/c/api/start', true);
+                    xhr.setRequestHeader('Accept', 'application/json');
+                    xhr.setRequestHeader('Content-Type', 'application/json');
+                    xhr.withCredentials = true;
+                    xhr.onreadystatechange = function() {
+                        if (xhr.readyState === 4) {
+                            try {
+                                const data = JSON.parse(xhr.responseText);
+                                resolve(data.id || data.conversationId || (data.conversation && data.conversation.id) || null);
+                            } catch(e) {
+                                console.error("[Bridge] Failed to parse /start response");
+                                resolve(null);
+                            }
+                        }
+                    };
+                    xhr.onerror = () => {
+                        console.error("[Bridge] Network error on /start");
+                        resolve(null);
+                    };
+                    xhr.send(JSON.stringify({}));
+                });
+                if (convId) {
+                    console.log("📌 Started new conversation:", convId);
                 }
-                convId = id;
-                console.log("📌 Started new conversation:", convId);
             }
 
-            // FIX 2: Fallback - Extract from URL only if creation failed and no explicit ID given
+            // Step 2: Fallback — extract from URL if /start failed (matches Python bridge exactly)
             if (!convId) {
                 const urlMatch = window.location.pathname.match(/\/chats\/([a-zA-Z0-9_-]+)/);
                 if (urlMatch && urlMatch[1]) {
                     convId = urlMatch[1];
                     console.log("📌 Fallback: Using conversation from URL:", convId);
-                }
-            }
-
-            // FIX 3: Fallback - get from existing conversations list
-            if (!convId) {
-                try {
-                    const res = await originalFetch('https://copilot.microsoft.com/c/api/conversations?types=chat%2Ccharacter%2Cxbox%2Cgroup', {
-                        method: 'GET',
-                        headers: { 'Accept': 'application/json' },
-                        credentials: 'include'
-                    });
-                    const data = await res.json();
-                    // Response shape may be { items: [...] } or an array
-                    const items = (data && data.items) ? data.items : (Array.isArray(data) ? data : null);
-                    if (items && items.length > 0 && items[0].id) {
-                        convId = items[0].id;
-                        console.log("📌 Fallback: Using existing conversation:", convId);
-                    }
-                } catch(e) {
-                    console.error("Failed to get conversations list:", e);
                 }
             }
 
@@ -569,7 +566,6 @@
             let assistantMessageId = null;  // Track which messageId belongs to assistant
 
             apiSocket.onopen = () => {
-                // FIX 4: Updated setOptions with new supportedFeatures and supportedCards + DELIM
                 apiSocket.send(JSON.stringify({
                     "event": "setOptions",
                     "supportedFeatures": [
@@ -585,13 +581,11 @@
                     ]
                 }) + DELIM);
 
-                // FIX 5: New event - report local consents + DELIM
                 apiSocket.send(JSON.stringify({
                     "event": "reportLocalConsents",
                     "grantedConsents": []
                 }) + DELIM);
 
-                // FIX 6: send event - mode is now lowercase "smart" + added messageId + DELIM
                 apiSocket.send(JSON.stringify({
                     "event": "send",
                     "conversationId": convId,
@@ -611,7 +605,6 @@
                     try {
                         const msg = JSON.parse(payload);
 
-                        // FIX 7: Track assistant's messageId from startMessage event
                         if (msg.event === 'startMessage') {
                             assistantMessageId = msg.messageId;
                             console.log("🤖 Assistant message started:", assistantMessageId);
