@@ -503,21 +503,36 @@
     }
 
     // ================================
-    // TERMINAL BRIDGE (SESSION-AWARE)
+    // TERMINAL BRIDGE (SESSION-AWARE) - FIXED TO MATCH PYTHON EXACTLY
     // ================================
     window.terminalBridge = {
         status: "idle",
         responseText: "",
+        lastConvId: null,
+
+        /**
+         * Safe JSON parser that handles the \x1e delimiter.
+         * Matches Python's safeParse exactly.
+         */
+        safeParse(str) {
+            try {
+                if (typeof str === 'string' && str.endsWith('\x1e')) {
+                    str = str.slice(0, -1);
+                }
+                return JSON.parse(str);
+            } catch(e) {
+                return null;
+            }
+        },
 
         async askCopilot(text, convIdOverride, onChunk, onDone) {
             this.status = "busy";
             this.responseText = "";
-            const originalFetch = window.fetch;
-            const DELIM = String.fromCharCode(30);
+            const OriginalWebSocket = window.WebSocket;
 
             let convId = convIdOverride || null;
 
-            // Step 1: Call /api/start via XHR (matches Python bridge exactly — XHR bypasses React/SPA fetch interceptors)
+            // Step 1: Call /api/start via XHR (matches Python bridge exactly)
             if (!convId) {
                 convId = await new Promise((resolve) => {
                     const xhr = new XMLHttpRequest();
@@ -557,15 +572,21 @@
             }
 
             if (!convId) {
+                this.responseText = "Error: API rejected session and no fallback ID found. Check browser.";
                 this.status = "idle";
-                onDone("❌ Session Error. Please solve CAPTCHA if visible.", null);
+                this.lastConvId = null;
+                onDone(this.responseText, null);
                 return;
             }
 
-            const apiSocket = new WebSocket('wss://copilot.microsoft.com/c/api/chat?api-version=2');
-            let assistantMessageId = null;  // Track which messageId belongs to assistant
+            this.lastConvId = convId;
+
+            // Step 3: Connect to WebSocket (matches Python bridge exactly - NO delimiter on send)
+            const apiSocket = new OriginalWebSocket('wss://copilot.microsoft.com/c/api/chat?api-version=2');
+            let assistantMessageId = null;
 
             apiSocket.onopen = () => {
+                // Send setOptions - NO DELIMITER (matches Python)
                 apiSocket.send(JSON.stringify({
                     "event": "setOptions",
                     "supportedFeatures": [
@@ -579,67 +600,49 @@
                         "healthcareEntity", "healthcareInfo", "chart",
                         "safetyHelpline", "quiz", "finance", "recipe", "personal"
                     ]
-                }) + DELIM);
+                }));
 
+                // Send reportLocalConsents - NO DELIMITER (matches Python)
                 apiSocket.send(JSON.stringify({
                     "event": "reportLocalConsents",
                     "grantedConsents": []
-                }) + DELIM);
+                }));
 
+                // Send message - NO DELIMITER and NO messageId (matches Python exactly)
                 apiSocket.send(JSON.stringify({
                     "event": "send",
                     "conversationId": convId,
-                    "messageId": crypto.randomUUID(),
                     "content": [{"type": "text", "text": text}],
                     "mode": "smart",
                     "context": {}
-                }) + DELIM);
+                }));
             };
 
+            // Step 4: Handle incoming messages (matches Python's safeParse approach exactly)
             apiSocket.onmessage = (event) => {
-                // Safely split the response by the SignalR \x1e delimiter
-                const payloads = event.data.toString().split(DELIM);
+                const msg = this.safeParse(event.data);
+                if (!msg) return;
 
-                for (const payload of payloads) {
-                    if (!payload) continue;
-                    
-                    // 🚨 LOG THE RAW PAYLOAD TO BROWSER CONSOLE SO YOU CAN SEE THE ERROR
-                    console.log("🔍 Raw Copilot WSS Payload:", payload); 
-
-                    try {
-                        const msg = JSON.parse(payload);
-
-                        if (msg.event === 'startMessage') {
-                            assistantMessageId = msg.messageId;
-                            console.log("🤖 Assistant message started:", assistantMessageId);
-                        } else if (msg.event === 'appendText') {
-                            if (!assistantMessageId || msg.messageId === assistantMessageId) {
-                                const chunkText = msg.text || "";
-                                this.responseText += chunkText;
-                                onChunk(this.responseText, chunkText, convId);
-                            }
-                        } else if (msg.event === 'error') {
-                            // 🚨 ACTUALLY CAPTURE AND SEND THE ERROR TO PYTHON
-                            const errorDetail = msg.message || JSON.stringify(msg);
-                            console.error("❌ Copilot explicitly sent an error:", errorDetail);
-                            this.responseText = "Copilot API Error: " + errorDetail;
-                            
-                            apiSocket.close();
-                            this.status = "idle";
-                            onDone(this.responseText, convId);
-                        } else if (msg.event === 'done') {
-                            apiSocket.close();
-                            this.status = "idle";
-                            onDone(this.responseText, convId);
-                        }
-                    } catch(e) {}
+                if (msg.event === 'startMessage') {
+                    assistantMessageId = msg.messageId;
+                    console.log("🤖 Assistant message started:", assistantMessageId);
+                } else if (msg.event === 'appendText' && msg.text) {
+                    // Only append text from the assistant, not user echo
+                    if (!assistantMessageId || msg.messageId === assistantMessageId) {
+                        this.responseText += msg.text;
+                        onChunk(this.responseText, msg.text, convId);
+                    }
+                } else if (msg.event === 'done' || msg.event === 'error') {
+                    apiSocket.close();
+                    this.status = "idle";
+                    onDone(this.responseText, convId);
                 }
             };
 
-            apiSocket.onerror = (err) => {
-                console.error("WebSocket error:", err);
+            apiSocket.onerror = () => {
+                this.responseText = "Error: Fatal WebSocket Error.";
                 this.status = "idle";
-                onDone("❌ Connection error", convId);
+                onDone(this.responseText, convId);
             };
 
             apiSocket.onclose = () => {
@@ -661,7 +664,7 @@
     //   { message, conversation_id }            → explicit thread
     //   { message, reuse_session: true }        → reuse last conversation
     //   { message, session_id: "my-bot" }       → named persistent thread
-    //   { message }                               → fresh conversation (default)
+    //   { message }                              → fresh conversation (default)
     //
     // The resolved convId is passed to askCopilot, and the returned usedConvId
     // is stored back in SessionManager so future calls can look it up.
