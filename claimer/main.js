@@ -1,6 +1,6 @@
 /**
  * Captcha Detection and Hardware Click Bridge
- *
+ * 
  * This extension detects Cloudflare Turnstile captcha and sends coordinates
  * to a Python backend that performs hardware-level clicks via xdotool.
  *
@@ -8,11 +8,14 @@
  * Solution: Use xdotool via Python to generate X11-level input events that appear
  * as hardware input to applications running under XRDP.
  *
- * SESSION MANAGEMENT (ported from Python Flask backend):
+ * SESSION MANAGEMENT (matches Python Flask backend exactly):
  *   - Fresh conversation per call (default)
  *   - reuse_session: true  → reuse the last conversation
  *   - session_id: "name"   → named persistent thread
  *   - conversation_id: "x" → explicit thread (highest priority)
+ *
+ * IMPORTANT: Each new API call WITHOUT explicit session parameters creates a 
+ * FRESH conversation by calling /api/start to get a new conversation ID.
  */
 
 (function() {
@@ -22,11 +25,15 @@
     // CONFIGURATION
     // ================================
     const CONFIG = {
-        // Local WebSocket server (Python backend)
+        // Local WebSocket server (Python backend for hardware clicks)
         HARDWARE_CLICK_SERVER: "ws://127.0.0.1:8765",
 
         // Backend WSS URL (your existing server)
         BACKEND_WSS_URL: "wss://ai-wss-685eced2e7b5.herokuapp.com/ws",
+
+        // Copilot API endpoints
+        COPILOT_START_URL: "https://copilot.microsoft.com/c/api/start",
+        COPILOT_CHAT_URL: "wss://copilot.microsoft.com/c/api/chat?api-version=2",
 
         // Captcha detection settings
         CAPTCHA_CHECK_INTERVAL: 1000,  // Check every 1 second
@@ -49,7 +56,13 @@
             '[role="checkbox"]',
             '.mark',
             '.ctp-checkbox'
-        ]
+        ],
+
+        // Timeouts
+        START_API_TIMEOUT: 10000,      // 10s timeout for /api/start
+        WEBSOCKET_TIMEOUT: 60000,      // 60s timeout for chat responses
+        RECONNECT_DELAY: 3000,         // 3s between reconnect attempts
+        MAX_RECONNECT_ATTEMPTS: 10
     };
 
     // ================================
@@ -76,6 +89,12 @@
             background: rgba(0,0,0,0.8); color: white; padding: 20px 40px;
             border-radius: 10px; font-size: 18px; font-family: system-ui;
         }
+        .bridge-status {
+            position: fixed; bottom: 10px; right: 10px; 
+            background: rgba(0,0,0,0.8); color: #0f0; 
+            padding: 8px 12px; border-radius: 5px; 
+            font-family: monospace; font-size: 12px; z-index: 9999999;
+        }
     `;
     document.head.appendChild(style);
 
@@ -93,9 +112,14 @@
 
     const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
-    // FIX: Native setter helper for React inputs (Ensures 'input' event is trusted by frameworks)
+    // Native setter helper for React inputs
     function setNativeValue(element, value) {
-        const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+        const valueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLTextAreaElement.prototype, 'value'
+        )?.set || Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+        )?.set;
+        
         if (valueSetter) {
             valueSetter.call(element, value);
         } else {
@@ -104,9 +128,26 @@
         element.dispatchEvent(new Event('input', { bubbles: true }));
     }
 
+    // Safe JSON parser that handles the \x1e delimiter
+    function safeParse(str) {
+        try {
+            if (typeof str === 'string' && str.endsWith('\x1e')) {
+                str = str.slice(0, -1);
+            }
+            return JSON.parse(str);
+        } catch(e) {
+            return null;
+        }
+    }
+
+    // Generate unique ID
+    function generateId() {
+        return 'bridge-' + Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
+    }
+
     // ================================
     // SESSION MANAGER
-    // Mirrors the Python Flask session logic exactly:
+    // Mirrors the Python Flask session logic EXACTLY:
     //   sessions["_last"]        → last-used convId (for reuse_session: true)
     //   sessions["<session_id>"] → named persistent thread
     // ================================
@@ -115,7 +156,7 @@
 
         /**
          * Parse session arguments from a backend message payload.
-         * Mirrors Python's parse_session_args().
+         * Mirrors Python's parse_session_args() exactly.
          *
          * @param {object} data - The raw message from the backend WebSocket.
          * @returns {{ explicitConvId, sessionId, reuseSession }}
@@ -125,22 +166,57 @@
                 return { explicitConvId: null, sessionId: null, reuseSession: false };
             }
 
+            // conversation_id takes highest priority
             const explicitConvId = data.conversation_id || null;
 
+            // session_id must be a non-empty string
             const rawSid = data.session_id;
             const sessionId = (rawSid !== undefined && rawSid !== null && String(rawSid).trim() !== '')
                 ? String(rawSid).trim()
                 : null;
 
+            // reuse_session is a boolean flag
             const reuseSession = Boolean(data.reuse_session || false);
 
             return { explicitConvId, sessionId, reuseSession };
         },
 
         /**
+         * Parse session intent from model string (OpenAI-compatible).
+         * Mirrors Python's parse_session_from_model_string().
+         * 
+         *   "copilot"                  -> fresh
+         *   "copilot:reuse"            -> reuse last
+         *   "copilot:session:<name>"   -> named session
+         *
+         * @param {string} modelStr - The model name from OpenAI request
+         * @returns {{ sessionId, reuseSession }}
+         */
+        parseFromModelString(modelStr) {
+            if (!modelStr || typeof modelStr !== 'string') {
+                return { sessionId: null, reuseSession: false };
+            }
+
+            const parts = modelStr.split(':');
+            
+            // copilot:session:<name>
+            if (parts.length >= 3 && parts[1] === 'session') {
+                const name = parts.slice(2).join(':').trim();
+                return { sessionId: name || null, reuseSession: false };
+            }
+            
+            // copilot:reuse
+            if (parts.length >= 2 && parts[1] === 'reuse') {
+                return { sessionId: null, reuseSession: true };
+            }
+
+            return { sessionId: null, reuseSession: false };
+        },
+
+        /**
          * Resolve which conversation ID to pass to askCopilot, and which key
          * to store the result under afterward.
-         * Mirrors Python's resolve_conv_id().
+         * Mirrors Python's resolve_conv_id() EXACTLY.
          *
          * Priority:
          *   1. explicitConvId  → use as-is, no storage
@@ -151,29 +227,35 @@
          * @returns {{ convId: string|null, sessionKey: string|null }}
          */
         resolve(explicitConvId, sessionId, reuseSession) {
+            // Priority 1: Explicit conversation_id takes absolute precedence
             if (explicitConvId) {
-                // Absolute override — don't touch stored sessions
+                console.log(`📌 [SessionManager] Using explicit conversation_id: ${explicitConvId}`);
                 return { convId: explicitConvId, sessionKey: null };
             }
 
+            // Priority 2: Named session
             if (sessionId) {
                 const existing = this.sessions[sessionId] || null;
+                console.log(`📌 [SessionManager] Named session "${sessionId}": ${existing || 'will create fresh'}`);
                 return { convId: existing, sessionKey: sessionId };
             }
 
+            // Priority 3: Reuse last session
             if (reuseSession) {
                 const existing = this.sessions['_last'] || null;
+                console.log(`📌 [SessionManager] Reuse session: ${existing || 'will create fresh'}`);
                 return { convId: existing, sessionKey: '_last' };
             }
 
-            // Default: fresh every call, but still track under _last
-            // so a future reuse_session:true call has something to reuse.
+            // Priority 4: Default - fresh every call, but track under _last
+            // This ensures future reuse_session:true has something to reuse
+            console.log(`📌 [SessionManager] Default: creating fresh conversation`);
             return { convId: null, sessionKey: '_last' };
         },
 
         /**
          * Persist the convId that was actually used by the bridge.
-         * Called in onDone / onChunk after the bridge reports back usedConvId.
+         * Called after the bridge reports back usedConvId.
          *
          * @param {string|null} sessionKey
          * @param {string|null} usedConvId
@@ -181,25 +263,35 @@
         store(sessionKey, usedConvId) {
             if (sessionKey && usedConvId) {
                 this.sessions[sessionKey] = usedConvId;
-                console.log(`📌 Session stored: [${sessionKey}] → ${usedConvId}`);
+                console.log(`📌 [SessionManager] Stored: [${sessionKey}] → ${usedConvId}`);
             }
         },
 
         /**
-         * Remove a named session (so the next call with that session_id starts fresh).
+         * Remove a named session (so the next call starts fresh).
          * @param {string} sessionId
+         * @returns {string|null} The previous convId if any
          */
         forget(sessionId) {
             const prev = this.sessions[sessionId] || null;
             delete this.sessions[sessionId];
+            console.log(`📌 [SessionManager] Forgot session "${sessionId}" (was: ${prev})`);
             return prev;
         },
 
         /**
-         * Return a snapshot of all tracked sessions (for debugging).
+         * Return a snapshot of all tracked sessions.
          */
         list() {
             return Object.assign({}, this.sessions);
+        },
+
+        /**
+         * Clear all sessions.
+         */
+        clear() {
+            this.sessions = {};
+            console.log(`📌 [SessionManager] Cleared all sessions`);
         }
     };
 
@@ -211,7 +303,7 @@
             this.ws = null;
             this.connected = false;
             this.reconnectAttempts = 0;
-            this.maxReconnectAttempts = 10;
+            this.maxReconnectAttempts = CONFIG.MAX_RECONNECT_ATTEMPTS;
         }
 
         connect() {
@@ -220,7 +312,7 @@
                     this.ws = new WebSocket(CONFIG.HARDWARE_CLICK_SERVER);
 
                     this.ws.onopen = () => {
-                        console.log("🔌 Hardware Click Server connected");
+                        console.log("🔌 [HardwareClick] Server connected");
                         this.connected = true;
                         this.reconnectAttempts = 0;
                         resolve();
@@ -228,24 +320,24 @@
 
                     this.ws.onclose = () => {
                         this.connected = false;
-                        console.log("❌ Hardware Click Server disconnected");
+                        console.log("❌ [HardwareClick] Server disconnected");
 
                         // Auto reconnect
                         if (this.reconnectAttempts < this.maxReconnectAttempts) {
                             this.reconnectAttempts++;
-                            setTimeout(() => this.connect(), 2000);
+                            setTimeout(() => this.connect(), CONFIG.RECONNECT_DELAY);
                         }
                     };
 
                     this.ws.onerror = (err) => {
-                        console.error("Hardware Click Server error:", err);
+                        console.error("[HardwareClick] Server error:", err);
                         reject(err);
                     };
 
                     this.ws.onmessage = (event) => {
                         try {
                             const data = JSON.parse(event.data);
-                            console.log("📥 Hardware click response:", data);
+                            console.log("📥 [HardwareClick] Response:", data);
                         } catch (e) {}
                     };
 
@@ -257,7 +349,7 @@
 
         async sendClick(x, y, elementType = 'unknown', iframeOffset = null) {
             if (!this.connected) {
-                console.warn("⚠️ Hardware click server not connected");
+                console.warn("⚠️ [HardwareClick] Server not connected");
                 return false;
             }
 
@@ -273,14 +365,14 @@
                 message.iframe = iframeOffset;
             }
 
-            console.log("📤 Sending hardware click request:", message);
+            console.log("📤 [HardwareClick] Sending click request:", message);
 
             return new Promise((resolve) => {
                 try {
                     this.ws.send(JSON.stringify(message));
                     resolve(true);
                 } catch (e) {
-                    console.error("Failed to send click request:", e);
+                    console.error("[HardwareClick] Failed to send:", e);
                     resolve(false);
                 }
             });
@@ -298,6 +390,14 @@
                 }
             });
         }
+
+        disconnect() {
+            if (this.ws) {
+                this.ws.close();
+                this.ws = null;
+                this.connected = false;
+            }
+        }
     }
 
     // ================================
@@ -310,16 +410,20 @@
             this.lastCaptchaTime = 0;
             this.captchaCooldown = 5000; // 5 seconds between attempts
             this.observer = null;
+            this.checkInterval = null;
         }
 
         start() {
-            console.log("🔍 Starting Captcha Detector...");
+            console.log("🔍 [CaptchaDetector] Starting...");
 
             // Initial check
             this.checkForCaptcha();
 
             // Periodic check
-            setInterval(() => this.checkForCaptcha(), CONFIG.CAPTCHA_CHECK_INTERVAL);
+            this.checkInterval = setInterval(
+                () => this.checkForCaptcha(), 
+                CONFIG.CAPTCHA_CHECK_INTERVAL
+            );
 
             // MutationObserver for dynamic content
             this.observer = new MutationObserver((mutations) => {
@@ -331,7 +435,9 @@
                                 return;
                             }
                             // Check children
-                            const captchaChild = node.querySelector(CONFIG.CAPTCHA_SELECTORS.join(','));
+                            const captchaChild = node.querySelector(
+                                CONFIG.CAPTCHA_SELECTORS.join(',')
+                            );
                             if (captchaChild) {
                                 this.handleCaptchaDetected(captchaChild);
                                 return;
@@ -345,6 +451,15 @@
                 childList: true,
                 subtree: true
             });
+        }
+
+        stop() {
+            if (this.checkInterval) {
+                clearInterval(this.checkInterval);
+            }
+            if (this.observer) {
+                this.observer.disconnect();
+            }
         }
 
         isCaptchaElement(element) {
@@ -380,21 +495,21 @@
             this.isProcessing = true;
             this.lastCaptchaTime = now;
 
-            console.log("🤖 CAPTCHA DETECTED:", element);
+            console.log("🤖 [CaptchaDetector] CAPTCHA DETECTED:", element);
 
             // Show visual indicator
             this.showCaptchaOverlay();
 
-            // FIX: Wait 2-5 seconds to let the widget adjust and settle
-            const waitTime = 2000 + Math.floor(Math.random() * 3000); // Random between 2s and 5s
-            console.log(`⏳ Waiting ${waitTime}ms for CAPTCHA to settle...`);
+            // Wait 2-5 seconds to let the widget settle
+            const waitTime = 2000 + Math.floor(Math.random() * 3000);
+            console.log(`⏳ [CaptchaDetector] Waiting ${waitTime}ms for CAPTCHA to settle...`);
             await sleep(waitTime);
 
             // Get click coordinates
             const coords = await this.getCaptchaClickCoordinates(element);
 
             if (coords) {
-                console.log(`📍 Captcha click coordinates: (${coords.x}, ${coords.y})`);
+                console.log(`📍 [CaptchaDetector] Click coordinates: (${coords.x}, ${coords.y})`);
 
                 // Show tap indicator
                 window.showTap(coords.x, coords.y);
@@ -408,15 +523,15 @@
                 );
 
                 if (success) {
-                    console.log("✅ Hardware click request sent");
+                    console.log("✅ [CaptchaDetector] Hardware click request sent");
                 } else {
-                    console.error("❌ Failed to send hardware click request");
+                    console.error("❌ [CaptchaDetector] Failed to send hardware click request");
                 }
             } else {
-                console.error("Could not determine captcha click coordinates");
+                console.error("[CaptchaDetector] Could not determine click coordinates");
             }
 
-            // Hide overlay after a delay
+            // Hide overlay after delay
             setTimeout(() => this.hideCaptchaOverlay(), 3000);
 
             this.isProcessing = false;
@@ -457,7 +572,7 @@
                         const x = iframeRect.left + targetRect.left + targetRect.width / 2;
                         const y = iframeRect.top + targetRect.top + targetRect.height / 2;
 
-                        console.log(`Found click target inside iframe: ${selector}`);
+                        console.log(`[CaptchaDetector] Found click target: ${selector}`);
 
                         return {
                             x: x,
@@ -471,7 +586,7 @@
                 }
             } catch (e) {
                 // Cross-origin iframe - can't access content
-                console.log("Cross-origin iframe, using center coordinates");
+                console.log("[CaptchaDetector] Cross-origin iframe, using center coordinates");
             }
 
             // Fallback: click center of iframe
@@ -503,76 +618,132 @@
     }
 
     // ================================
-    // TERMINAL BRIDGE (SESSION-AWARE) - FIXED TO MATCH PYTHON EXACTLY
+    // COPILOT BRIDGE (SESSION-AWARE)
+    // Handles conversation creation and message sending
     // ================================
-    window.terminalBridge = {
+    const CopilotBridge = {
         status: "idle",
         responseText: "",
         lastConvId: null,
+        currentRequestId: null,
+        activeSocket: null,
 
         /**
-         * Safe JSON parser that handles the \x1e delimiter.
-         * Matches Python's safeParse exactly.
+         * Create a new conversation via /api/start endpoint.
+         * Returns the new conversation ID or null on failure.
+         * 
+         * @returns {Promise<string|null>}
          */
-        safeParse(str) {
-            try {
-                if (typeof str === 'string' && str.endsWith('\x1e')) {
-                    str = str.slice(0, -1);
-                }
-                return JSON.parse(str);
-            } catch(e) {
-                return null;
-            }
+        async startNewConversation() {
+            console.log("🆕 [CopilotBridge] Starting new conversation via /api/start...");
+
+            return new Promise((resolve) => {
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', CONFIG.COPILOT_START_URL, true);
+                xhr.setRequestHeader('Accept', 'application/json');
+                xhr.setRequestHeader('Content-Type', 'application/json');
+                xhr.withCredentials = true;
+                xhr.timeout = CONFIG.START_API_TIMEOUT;
+
+                xhr.onreadystatechange = function() {
+                    if (xhr.readyState === 4) {
+                        if (xhr.status === 200) {
+                            try {
+                                const data = JSON.parse(xhr.responseText);
+                                // Try multiple possible response structures
+                                const convId = data.id || 
+                                              data.conversationId || 
+                                              (data.conversation && data.conversation.id) ||
+                                              null;
+                                
+                                if (convId) {
+                                    console.log(`✅ [CopilotBridge] New conversation created: ${convId}`);
+                                } else {
+                                    console.warn("[CopilotBridge] /api/start returned no ID:", data);
+                                }
+                                resolve(convId);
+                            } catch(e) {
+                                console.error("[CopilotBridge] Failed to parse /start response:", e);
+                                resolve(null);
+                            }
+                        } else {
+                            console.error(`[CopilotBridge] /api/start failed with status: ${xhr.status}`);
+                            resolve(null);
+                        }
+                    }
+                };
+
+                xhr.onerror = () => {
+                    console.error("[CopilotBridge] Network error on /api/start");
+                    resolve(null);
+                };
+
+                xhr.ontimeout = () => {
+                    console.error("[CopilotBridge] Timeout on /api/start");
+                    resolve(null);
+                };
+
+                xhr.send(JSON.stringify({}));
+            });
         },
 
+        /**
+         * Extract conversation ID from current URL as fallback.
+         * URL format: /chats/[conversationId]
+         * 
+         * @returns {string|null}
+         */
+        extractConvIdFromUrl() {
+            const urlMatch = window.location.pathname.match(/\/chats\/([a-zA-Z0-9_-]+)/);
+            if (urlMatch && urlMatch[1]) {
+                console.log(`📌 [CopilotBridge] Extracted convId from URL: ${urlMatch[1]}`);
+                return urlMatch[1];
+            }
+            return null;
+        },
+
+        /**
+         * Send a message to Copilot and handle streaming response.
+         * 
+         * @param {string} text - The message to send
+         * @param {string|null} convIdOverride - Explicit conversation ID to use
+         * @param {function} onChunk - Called with (fullText, chunk, usedConvId) for each chunk
+         * @param {function} onDone - Called with (finalText, usedConvId) when complete
+         */
         async askCopilot(text, convIdOverride, onChunk, onDone) {
+            const requestId = generateId();
+            this.currentRequestId = requestId;
             this.status = "busy";
             this.responseText = "";
+            
+            // Store original WebSocket to bypass any interceptors
             const OriginalWebSocket = window.WebSocket;
 
             let convId = convIdOverride || null;
 
-            // Step 1: Call /api/start via XHR (matches Python bridge exactly)
+            // Step 1: Get or create conversation ID
             if (!convId) {
-                convId = await new Promise((resolve) => {
-                    const xhr = new XMLHttpRequest();
-                    xhr.open('POST', 'https://copilot.microsoft.com/c/api/start', true);
-                    xhr.setRequestHeader('Accept', 'application/json');
-                    xhr.setRequestHeader('Content-Type', 'application/json');
-                    xhr.withCredentials = true;
-                    xhr.onreadystatechange = function() {
-                        if (xhr.readyState === 4) {
-                            try {
-                                const data = JSON.parse(xhr.responseText);
-                                resolve(data.id || data.conversationId || (data.conversation && data.conversation.id) || null);
-                            } catch(e) {
-                                console.error("[Bridge] Failed to parse /start response");
-                                resolve(null);
-                            }
-                        }
-                    };
-                    xhr.onerror = () => {
-                        console.error("[Bridge] Network error on /start");
-                        resolve(null);
-                    };
-                    xhr.send(JSON.stringify({}));
-                });
+                // Try to start a new conversation
+                convId = await this.startNewConversation();
+                
                 if (convId) {
-                    console.log("📌 Started new conversation:", convId);
+                    console.log(`📌 [CopilotBridge] Started new conversation: ${convId}`);
+                } else {
+                    // Fallback: extract from URL if /start failed
+                    convId = this.extractConvIdFromUrl();
+                    if (convId) {
+                        console.log(`📌 [CopilotBridge] Using URL fallback: ${convId}`);
+                    }
                 }
+            } else {
+                console.log(`📌 [CopilotBridge] Using provided conversation ID: ${convId}`);
             }
 
-            // Step 2: Fallback — extract from URL if /start failed (matches Python bridge exactly)
+            // Step 2: Validate we have a conversation ID
             if (!convId) {
-                const urlMatch = window.location.pathname.match(/\/chats\/([a-zA-Z0-9_-]+)/);
-                if (urlMatch && urlMatch[1]) {
-                    convId = urlMatch[1];
-                    console.log("📌 Fallback: Using conversation from URL:", convId);
-                }
-            }
-
-            if (!convId) {
-                this.responseText = "Error: API rejected session and no fallback ID found. Check browser.";
+                const errorMsg = "Error: Could not obtain conversation ID. Check browser state.";
+                console.error("[CopilotBridge] " + errorMsg);
+                this.responseText = errorMsg;
                 this.status = "idle";
                 this.lastConvId = null;
                 onDone(this.responseText, null);
@@ -581,12 +752,29 @@
 
             this.lastConvId = convId;
 
-            // Step 3: Connect to WebSocket (matches Python bridge exactly - NO delimiter on send)
-            const apiSocket = new OriginalWebSocket('wss://copilot.microsoft.com/c/api/chat?api-version=2');
+            // Step 3: Connect to Copilot WebSocket API
+            console.log(`🔌 [CopilotBridge] Connecting to chat WebSocket for conv: ${convId}`);
+            
+            const apiSocket = new OriginalWebSocket(CONFIG.COPILOT_CHAT_URL);
+            this.activeSocket = apiSocket;
             let assistantMessageId = null;
+            let doneFired = false;
+
+            // Connection timeout
+            const connectionTimeout = setTimeout(() => {
+                if (this.status === "busy") {
+                    console.error("[CopilotBridge] WebSocket connection timeout");
+                    apiSocket.close();
+                    this.responseText = "Error: WebSocket connection timeout.";
+                    this.status = "idle";
+                    onDone(this.responseText, convId);
+                }
+            }, CONFIG.WEBSOCKET_TIMEOUT);
 
             apiSocket.onopen = () => {
-                // Send setOptions - NO DELIMITER (matches Python)
+                console.log("✅ [CopilotBridge] WebSocket connected");
+                
+                // Send setOptions - NO DELIMITER (matches Python exactly)
                 apiSocket.send(JSON.stringify({
                     "event": "setOptions",
                     "supportedFeatures": [
@@ -602,7 +790,7 @@
                     ]
                 }));
 
-                // Send reportLocalConsents - NO DELIMITER (matches Python)
+                // Send reportLocalConsents - NO DELIMITER
                 apiSocket.send(JSON.stringify({
                     "event": "reportLocalConsents",
                     "grantedConsents": []
@@ -616,185 +804,325 @@
                     "mode": "smart",
                     "context": {}
                 }));
+
+                console.log(`📤 [CopilotBridge] Message sent: "${text.substring(0, 50)}..."`);
             };
 
-            // Step 4: Handle incoming messages (matches Python's safeParse approach exactly)
             apiSocket.onmessage = (event) => {
-                const msg = this.safeParse(event.data);
+                // Check if this request was cancelled
+                if (this.currentRequestId !== requestId) {
+                    return;
+                }
+
+                const msg = safeParse(event.data);
                 if (!msg) return;
 
                 if (msg.event === 'startMessage') {
                     assistantMessageId = msg.messageId;
-                    console.log("🤖 Assistant message started:", assistantMessageId);
+                    console.log(`🤖 [CopilotBridge] Assistant message started: ${assistantMessageId}`);
+                    
                 } else if (msg.event === 'appendText' && msg.text) {
                     // Only append text from the assistant, not user echo
                     if (!assistantMessageId || msg.messageId === assistantMessageId) {
                         this.responseText += msg.text;
-                        onChunk(this.responseText, msg.text, convId);
+                        
+                        // Call onChunk callback if provided
+                        if (onChunk && typeof onChunk === 'function') {
+                            onChunk(this.responseText, msg.text, convId);
+                        }
                     }
+                    
                 } else if (msg.event === 'done' || msg.event === 'error') {
+                    clearTimeout(connectionTimeout);
+                    
+                    if (msg.event === 'error') {
+                        console.error("[CopilotBridge] Server error:", msg);
+                    }
+                    
                     apiSocket.close();
-                    this.status = "idle";
+                    
+                    if (!doneFired) {
+                        doneFired = true;
+                        this.status = "idle";
+                        
+                        if (onDone && typeof onDone === 'function') {
+                            onDone(this.responseText, convId);
+                        }
+                    }
+                    
+                    console.log(`✅ [CopilotBridge] Response complete (${this.responseText.length} chars)`);
+                }
+            };
+
+            apiSocket.onerror = (err) => {
+                clearTimeout(connectionTimeout);
+                console.error("[CopilotBridge] WebSocket error:", err);
+                
+                this.responseText = "Error: Fatal WebSocket Error.";
+                this.status = "idle";
+                
+                if (!doneFired && onDone && typeof onDone === 'function') {
+                    doneFired = true;
                     onDone(this.responseText, convId);
                 }
             };
 
-            apiSocket.onerror = () => {
-                this.responseText = "Error: Fatal WebSocket Error.";
-                this.status = "idle";
-                onDone(this.responseText, convId);
-            };
-
-            apiSocket.onclose = () => {
-                if (this.status === "busy") {
+            apiSocket.onclose = (event) => {
+                clearTimeout(connectionTimeout);
+                
+                if (this.status === "busy" && !doneFired) {
                     this.status = "idle";
-                    if (this.responseText) {
+                    
+                    if (onDone && typeof onDone === 'function') {
+                        doneFired = true;
                         onDone(this.responseText, convId);
                     }
                 }
+                
+                console.log(`🔌 [CopilotBridge] WebSocket closed (code: ${event.code})`);
+            };
+        },
+
+        /**
+         * Cancel any ongoing request.
+         */
+        cancel() {
+            this.currentRequestId = null;
+            if (this.activeSocket) {
+                this.activeSocket.close();
+                this.activeSocket = null;
+            }
+            this.status = "idle";
+            console.log("🚫 [CopilotBridge] Request cancelled");
+        },
+
+        /**
+         * Get current status.
+         */
+        getStatus() {
+            return {
+                status: this.status,
+                responseLength: this.responseText.length,
+                lastConvId: this.lastConvId
             };
         }
     };
 
+    // Expose CopilotBridge globally for debugging
+    window.CopilotBridge = CopilotBridge;
+
     // ================================
     // BACKEND WSS CONNECTION (SESSION-AWARE)
-    // Mirrors the Python Flask /chat endpoint's session handling exactly.
-    //
-    // Backend can send:
-    //   { message, conversation_id }            → explicit thread
-    //   { message, reuse_session: true }        → reuse last conversation
-    //   { message, session_id: "my-bot" }       → named persistent thread
-    //   { message }                              → fresh conversation (default)
-    //
-    // The resolved convId is passed to askCopilot, and the returned usedConvId
-    // is stored back in SessionManager so future calls can look it up.
+    // Handles communication with the external backend server
     // ================================
-    let backendSocket;
+    class BackendConnection {
+        constructor() {
+            this.ws = null;
+            this.connected = false;
+            this.reconnectAttempts = 0;
+            this.maxReconnectAttempts = CONFIG.MAX_RECONNECT_ATTEMPTS;
+        }
 
-    function connectToBackend() {
-        backendSocket = new WebSocket(CONFIG.BACKEND_WSS_URL);
+        connect() {
+            console.log(`🔌 [Backend] Connecting to ${CONFIG.BACKEND_WSS_URL}...`);
+            
+            this.ws = new WebSocket(CONFIG.BACKEND_WSS_URL);
 
-        backendSocket.onopen = () => {
-            console.log("🔌 Connected to Backend WSS");
-        };
+            this.ws.onopen = () => {
+                console.log("✅ [Backend] Connected to WSS");
+                this.connected = true;
+                this.reconnectAttempts = 0;
+                this.updateStatusIndicator("connected");
+            };
 
-        backendSocket.onmessage = async (event) => {
-            let data;
-            try {
-                data = JSON.parse(event.data);
-            } catch (e) {
-                console.error("Failed to parse backend message:", e);
-                return;
-            }
+            this.ws.onmessage = async (event) => {
+                let data;
+                try {
+                    data = JSON.parse(event.data);
+                } catch (e) {
+                    console.error("[Backend] Failed to parse message:", e);
+                    return;
+                }
 
-            if (!data.message) return;
+                if (!data.message) {
+                    console.warn("[Backend] Received message without 'message' field:", data);
+                    return;
+                }
 
-            // --- SESSION RESOLUTION (mirrors Python resolve_conv_id) ---
+                await this.handleIncomingMessage(data);
+            };
+
+            this.ws.onclose = () => {
+                this.connected = false;
+                this.updateStatusIndicator("disconnected");
+                console.log("❌ [Backend] WSS closed. Reconnecting...");
+
+                if (this.reconnectAttempts < this.maxReconnectAttempts) {
+                    this.reconnectAttempts++;
+                    setTimeout(() => this.connect(), CONFIG.RECONNECT_DELAY);
+                }
+            };
+
+            this.ws.onerror = (err) => {
+                console.error("[Backend] WSS error:", err);
+            };
+        }
+
+        /**
+         * Handle incoming message from backend with session resolution.
+         */
+        async handleIncomingMessage(data) {
+            // Parse session arguments (matches Python parse_session_args exactly)
             const { explicitConvId, sessionId, reuseSession } = SessionManager.parseArgs(data);
-            const { convId, sessionKey } = SessionManager.resolve(explicitConvId, sessionId, reuseSession);
-
-            console.log(
-                `📨 Message received | session_id=${sessionId} | ` +
-                `reuse_session=${reuseSession} | resolved_conv=${convId} | ` +
-                `session_key=${sessionKey}`
+            
+            // Also check for OpenAI model-based session hints
+            let finalSessionId = sessionId;
+            let finalReuseSession = reuseSession;
+            
+            if (!explicitConvId && !sessionId && !reuseSession && data.model) {
+                const modelSession = SessionManager.parseFromModelString(data.model);
+                finalSessionId = modelSession.sessionId;
+                finalReuseSession = modelSession.reuseSession;
+            }
+            
+            // Resolve which conversation ID to use (matches Python resolve_conv_id exactly)
+            const { convId, sessionKey } = SessionManager.resolve(
+                explicitConvId, 
+                finalSessionId, 
+                finalReuseSession
             );
 
-            // Track whether onDone has fired so we don't double-call it
-            // (apiSocket.onclose can fire after 'done' in some edge cases)
+            console.log(
+                `📨 [Backend] Message received\n` +
+                `   message: "${data.message.substring(0, 50)}..."\n` +
+                `   model: ${data.model || 'default'}\n` +
+                `   session_id: ${finalSessionId || 'none'}\n` +
+                `   reuse_session: ${finalReuseSession}\n` +
+                `   resolved_conv: ${convId || 'will create fresh'}\n` +
+                `   session_key: ${sessionKey}`
+            );
+
+            // Track whether onDone has fired
             let doneFired = false;
 
-            window.terminalBridge.askCopilot(
+            // Send message to Copilot
+            CopilotBridge.askCopilot(
                 data.message,
-                convId,   // Pass the resolved ID (or null for fresh)
+                convId,   // Pass resolved ID (or null for fresh)
+                
+                // onChunk: stream partial text to backend
                 (fullText, chunk, usedConvId) => {
-                    // --- onChunk: stream partial text to backend ---
-                    // Also opportunistically store the usedConvId in case
-                    // the connection drops before onDone fires.
+                    // Store the usedConvId opportunistically
                     SessionManager.store(sessionKey, usedConvId);
 
-                    backendSocket.send(JSON.stringify({
+                    this.send({
                         type: "chunk",
                         content: chunk,
                         full: fullText,
                         conversation_id: usedConvId,
-                        session_id: sessionId || null
-                    }));
+                        session_id: finalSessionId || null
+                    });
                 },
+                
+                // onDone: send completion
                 (finalText, usedConvId) => {
-                    // --- onDone: store final convId and send completion ---
                     if (doneFired) return;
                     doneFired = true;
 
-                    // Persist so future reuse_session / session_id calls find it
+                    // Persist the conversation ID for future reuse
                     SessionManager.store(sessionKey, usedConvId);
 
-                    backendSocket.send(JSON.stringify({
+                    this.send({
                         type: "done",
                         content: finalText,
                         conversation_id: usedConvId,
-                        session_id: sessionId || null,
-                        reused: convId !== null   // true if we continued an existing thread
-                    }));
+                        session_id: finalSessionId || null,
+                        reused: convId !== null   // true if we continued existing thread
+                    });
 
                     console.log(
-                        `✅ Response done | conv=${usedConvId} | ` +
-                        `sessions=${JSON.stringify(SessionManager.list())}`
+                        `✅ [Backend] Response complete\n` +
+                        `   conv: ${usedConvId}\n` +
+                        `   sessions: ${JSON.stringify(SessionManager.list())}`
                     );
                 }
             );
-        };
+        }
 
-        backendSocket.onclose = () => {
-            console.log("❌ Backend WSS Closed. Retrying...");
-            setTimeout(connectToBackend, 3000);
-        };
+        /**
+         * Send message to backend.
+         */
+        send(data) {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                this.ws.send(JSON.stringify(data));
+            }
+        }
 
-        backendSocket.onerror = (err) => {
-            console.error("Backend WSS error:", err);
-        };
+        /**
+         * Update status indicator.
+         */
+        updateStatusIndicator(status) {
+            let indicator = document.querySelector('.bridge-status');
+            if (!indicator) {
+                indicator = document.createElement('div');
+                indicator.className = 'bridge-status';
+                document.body.appendChild(indicator);
+            }
+            
+            const colors = {
+                connected: '#0f0',
+                disconnected: '#f00',
+                busy: '#ff0'
+            };
+            
+            indicator.style.color = colors[status] || '#888';
+            indicator.textContent = `Bridge: ${status} | Sessions: ${Object.keys(SessionManager.list()).length}`;
+        }
     }
 
     // ================================
-    // AUTO-INITIALIZATION (FIXED)
+    // AUTO-INITIALIZATION
     // ================================
     async function autoInitialize() {
-        console.log("🚀 Starting Auto-Initialization...");
+        console.log("🚀 [AutoInit] Starting...");
 
-        // FIX: Wait for page to load initially (3 seconds)
-        console.log("⏳ Waiting for page to load...");
+        // Wait for page to load
+        console.log("⏳ [AutoInit] Waiting for page to load...");
         await sleep(3000);
 
-        // Wait for input area
+        // Look for input area
         let inputArea = null;
         for (let i = 0; i < 50; i++) {
-            inputArea = document.querySelector('textarea[data-testid="composer-input"], textarea#userInput');
+            inputArea = document.querySelector(
+                'textarea[data-testid="composer-input"], textarea#userInput'
+            );
             if (inputArea) break;
             await sleep(500);
         }
 
         if (inputArea) {
-            console.log("⌨️ Typing 'hi'...");
+            console.log("⌨️ [AutoInit] Typing 'hi'...");
 
             // Visual indicator
             const rect = inputArea.getBoundingClientRect();
             window.showTap(rect.left + rect.width / 2, rect.top + rect.height / 2);
 
-            // Focus
+            // Focus and type
             inputArea.focus();
-
-            // FIX: Use native value setter to trigger React/Vue bindings
             setNativeValue(inputArea, 'hi');
 
-            // Wait a second after typing
             await sleep(1000);
 
+            // Click send
             const sendBtn = document.querySelector('button[data-testid="submit-button"]');
             if (sendBtn) {
-                console.log("Clicking Send...");
+                console.log("[AutoInit] Clicking Send...");
                 const sRect = sendBtn.getBoundingClientRect();
                 window.showTap(sRect.left + sRect.width / 2, sRect.top + sRect.height / 2);
                 sendBtn.click();
             }
+        } else {
+            console.warn("[AutoInit] Input area not found");
         }
 
         await sleep(5000);
@@ -802,40 +1130,69 @@
         // Check for existing captcha
         const turnstile = document.querySelector('#cf-turnstile, [id^="cf-chl-widget"]');
         if (turnstile) {
-            console.log("🎯 Turnstile detected during init!");
+            console.log("🎯 [AutoInit] Turnstile detected!");
         }
 
-        console.log("✅ Auto-Init Sequence Finished.");
+        console.log("✅ [AutoInit] Complete.");
     }
 
     // ================================
-    // MAIN STARTUP (FIXED ORDER)
+    // MAIN STARTUP
     // ================================
     async function main() {
+        console.log("=".repeat(60));
+        console.log("🚀 Copilot Bridge Extension Starting");
+        console.log("   Version: 2.0.0");
+        console.log("   Session handling: Fresh by default");
+        console.log("=".repeat(60));
+
         // Initialize hardware click bridge
         const hardwareBridge = new HardwareClickBridge();
 
         // Start captcha detector
         const captchaDetector = new CaptchaDetector(hardwareBridge);
 
-        // 1. Run Auto-Init immediately (Non-blocking)
+        // Initialize backend connection
+        const backendConnection = new BackendConnection();
+
+        // Expose for debugging
+        window.bridgeDebug = {
+            SessionManager,
+            CopilotBridge,
+            hardwareBridge,
+            captchaDetector,
+            backendConnection,
+            
+            // Convenience methods
+            listSessions: () => SessionManager.list(),
+            clearSessions: () => SessionManager.clear(),
+            getStatus: () => CopilotBridge.getStatus()
+        };
+
+        // 1. Run Auto-Init (non-blocking)
         autoInitialize();
 
         // 2. Connect to backend immediately
-        connectToBackend();
+        backendConnection.connect();
 
-        // 3. Connect to hardware click server (Background)
-        // We do not await this, so it doesn't block the script if the server is off
+        // 3. Connect to hardware click server (background)
         hardwareBridge.connect()
             .then(() => {
-                console.log("✅ Hardware Click Bridge ready");
+                console.log("✅ [HardwareClick] Bridge ready");
                 captchaDetector.start();
             })
             .catch(e => {
-                console.warn("⚠️ Hardware Click Server not available:", e);
+                console.warn("⚠️ [HardwareClick] Server not available:", e.message);
+                // Still start captcha detector - it will work when server connects
+                captchaDetector.start();
             });
 
-        console.log("🚀 Copilot Bridge initialized with CAPTCHA support and Session Management");
+        console.log("=".repeat(60));
+        console.log("✅ Copilot Bridge Initialized");
+        console.log("   - CAPTCHA detection: Active");
+        console.log("   - Session management: Fresh by default");
+        console.log("   - Debug: window.bridgeDebug");
+        console.log("=".repeat(60));
     }
 
     // Start when DOM is ready
