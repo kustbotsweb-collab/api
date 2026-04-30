@@ -602,6 +602,10 @@
 
                 for (const payload of payloads) {
                     if (!payload) continue;
+                    
+                    // 🚨 LOG THE RAW PAYLOAD TO BROWSER CONSOLE SO YOU CAN SEE THE ERROR
+                    console.log("🔍 Raw Copilot WSS Payload:", payload); 
+
                     try {
                         const msg = JSON.parse(payload);
 
@@ -609,13 +613,21 @@
                             assistantMessageId = msg.messageId;
                             console.log("🤖 Assistant message started:", assistantMessageId);
                         } else if (msg.event === 'appendText') {
-                            // Only append text from the assistant, not user echo
                             if (!assistantMessageId || msg.messageId === assistantMessageId) {
                                 const chunkText = msg.text || "";
                                 this.responseText += chunkText;
                                 onChunk(this.responseText, chunkText, convId);
                             }
-                        } else if (msg.event === 'done' || msg.event === 'error') {
+                        } else if (msg.event === 'error') {
+                            // 🚨 ACTUALLY CAPTURE AND SEND THE ERROR TO PYTHON
+                            const errorDetail = msg.message || JSON.stringify(msg);
+                            console.error("❌ Copilot explicitly sent an error:", errorDetail);
+                            this.responseText = "Copilot API Error: " + errorDetail;
+                            
+                            apiSocket.close();
+                            this.status = "idle";
+                            onDone(this.responseText, convId);
+                        } else if (msg.event === 'done') {
                             apiSocket.close();
                             this.status = "idle";
                             onDone(this.responseText, convId);
@@ -649,7 +661,7 @@
     //   { message, conversation_id }            → explicit thread
     //   { message, reuse_session: true }        → reuse last conversation
     //   { message, session_id: "my-bot" }       → named persistent thread
-    //   { message }                              → fresh conversation (default)
+    //   { message }                               → fresh conversation (default)
     //
     // The resolved convId is passed to askCopilot, and the returned usedConvId
     // is stored back in SessionManager so future calls can look it up.
