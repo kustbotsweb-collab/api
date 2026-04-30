@@ -15,7 +15,7 @@
  *   - conversation_id: "x" → explicit thread (highest priority)
  *
  * IMPORTANT: Each new API call WITHOUT explicit session parameters creates a 
- * FRESH conversation by calling /api/start to get a new conversation ID.
+ * FRESH conversation by calling POST /api/conversations to get a new conversation ID.
  */
 
 (function() {
@@ -32,7 +32,7 @@
         BACKEND_WSS_URL: "wss://ai-wss-685eced2e7b5.herokuapp.com/ws",
 
         // Copilot API endpoints
-        COPILOT_START_URL: "https://copilot.microsoft.com/c/api/start",
+        COPILOT_CONVERSATIONS_URL: "https://copilot.microsoft.com/c/api/conversations",
         COPILOT_CHAT_URL: "wss://copilot.microsoft.com/c/api/chat?api-version=2",
 
         // Captcha detection settings
@@ -59,9 +59,9 @@
         ],
 
         // Timeouts
-        START_API_TIMEOUT: 10000,      // 10s timeout for /api/start
-        WEBSOCKET_TIMEOUT: 60000,      // 60s timeout for chat responses
-        RECONNECT_DELAY: 3000,         // 3s between reconnect attempts
+        API_TIMEOUT: 10000,              // 10s timeout for API calls
+        WEBSOCKET_TIMEOUT: 60000,        // 60s timeout for chat responses
+        RECONNECT_DELAY: 3000,           // 3s between reconnect attempts
         MAX_RECONNECT_ATTEMPTS: 10
     };
 
@@ -629,60 +629,62 @@
         activeSocket: null,
 
         /**
-         * Create a new conversation via /api/start endpoint.
+         * Create a new conversation via POST /api/conversations endpoint.
          * Returns the new conversation ID or null on failure.
+         * 
+         * Network log shows:
+         *   POST https://copilot.microsoft.com/c/api/conversations
+         *   Response: {"type":"chat","id":"GCCeAtUeehcop149BbeDW","title":"","updatedAt":"..."}
          * 
          * @returns {Promise<string|null>}
          */
         async startNewConversation() {
-            console.log("🆕 [CopilotBridge] Starting new conversation via /api/start...");
+            console.log("🆕 [CopilotBridge] Creating new conversation via POST /api/conversations...");
 
             return new Promise((resolve) => {
                 const xhr = new XMLHttpRequest();
-                xhr.open('POST', CONFIG.COPILOT_START_URL, true);
+                xhr.open('POST', CONFIG.COPILOT_CONVERSATIONS_URL, true);
                 xhr.setRequestHeader('Accept', 'application/json');
                 xhr.setRequestHeader('Content-Type', 'application/json');
                 xhr.withCredentials = true;
-                xhr.timeout = CONFIG.START_API_TIMEOUT;
+                xhr.timeout = CONFIG.API_TIMEOUT;
 
                 xhr.onreadystatechange = function() {
                     if (xhr.readyState === 4) {
-                        if (xhr.status === 200) {
+                        if (xhr.status === 200 || xhr.status === 201) {
                             try {
                                 const data = JSON.parse(xhr.responseText);
-                                // Try multiple possible response structures
-                                const convId = data.id || 
-                                              data.conversationId || 
-                                              (data.conversation && data.conversation.id) ||
-                                              null;
+                                // The conversation ID is in the "id" field
+                                const convId = data.id || null;
                                 
                                 if (convId) {
                                     console.log(`✅ [CopilotBridge] New conversation created: ${convId}`);
                                 } else {
-                                    console.warn("[CopilotBridge] /api/start returned no ID:", data);
+                                    console.warn("[CopilotBridge] /api/conversations returned no ID:", data);
                                 }
                                 resolve(convId);
                             } catch(e) {
-                                console.error("[CopilotBridge] Failed to parse /start response:", e);
+                                console.error("[CopilotBridge] Failed to parse response:", e);
                                 resolve(null);
                             }
                         } else {
-                            console.error(`[CopilotBridge] /api/start failed with status: ${xhr.status}`);
+                            console.error(`[CopilotBridge] /api/conversations failed with status: ${xhr.status}`);
                             resolve(null);
                         }
                     }
                 };
 
                 xhr.onerror = () => {
-                    console.error("[CopilotBridge] Network error on /api/start");
+                    console.error("[CopilotBridge] Network error on /api/conversations");
                     resolve(null);
                 };
 
                 xhr.ontimeout = () => {
-                    console.error("[CopilotBridge] Timeout on /api/start");
+                    console.error("[CopilotBridge] Timeout on /api/conversations");
                     resolve(null);
                 };
 
+                // Send empty body - matches browser behavior
                 xhr.send(JSON.stringify({}));
             });
         },
@@ -723,13 +725,13 @@
 
             // Step 1: Get or create conversation ID
             if (!convId) {
-                // Try to start a new conversation
+                // Create a new conversation via POST /api/conversations
                 convId = await this.startNewConversation();
                 
                 if (convId) {
-                    console.log(`📌 [CopilotBridge] Started new conversation: ${convId}`);
+                    console.log(`📌 [CopilotBridge] Created new conversation: ${convId}`);
                 } else {
-                    // Fallback: extract from URL if /start failed
+                    // Fallback: extract from URL if API failed
                     convId = this.extractConvIdFromUrl();
                     if (convId) {
                         console.log(`📌 [CopilotBridge] Using URL fallback: ${convId}`);
@@ -797,6 +799,8 @@
                 }));
 
                 // Send message - NO DELIMITER and NO messageId (matches Python exactly)
+                // This matches the network log exactly:
+                // {"event":"send","conversationId":"GCCeAtUeehcop149BbeDW","content":[{"type":"text","text":"hi"}],"mode":"smart","context":{}}
                 apiSocket.send(JSON.stringify({
                     "event": "send",
                     "conversationId": convId,
@@ -1142,8 +1146,9 @@
     async function main() {
         console.log("=".repeat(60));
         console.log("🚀 Copilot Bridge Extension Starting");
-        console.log("   Version: 2.0.0");
+        console.log("   Version: 2.1.0");
         console.log("   Session handling: Fresh by default");
+        console.log("   API: POST /api/conversations for new conversations");
         console.log("=".repeat(60));
 
         // Initialize hardware click bridge
